@@ -198,6 +198,7 @@ type darwinTray struct {
 	nsItems        map[uint32]darwin.ID // item.ID() -> NSMenuItem handle (incl. submenus)
 	menuMu         sync.Mutex
 	pendingUpdates chan menuItemSnapshot // buffered channel for main-thread dispatch
+	mainFuncs      chan func()           // tray-level mutations queued for the main thread
 }
 
 // goSystrayTargetClass is the custom ObjC class registered once for click handling.
@@ -223,6 +224,7 @@ func NewPlatformTray(callbacks *Callbacks) PlatformTray {
 		menuActions:    make(map[int]func()),
 		nsItems:        make(map[uint32]darwin.ID),
 		pendingUpdates: make(chan menuItemSnapshot, 64),
+		mainFuncs:      make(chan func(), 64),
 	}
 }
 
@@ -382,7 +384,7 @@ func registerGoSystrayTarget() (darwin.Class, error) {
 
 // SetIcon sets the tray icon from PNG bytes.
 // The image is resized to 22x22 points, the standard macOS menu bar icon size.
-func (t *darwinTray) SetIcon(png []byte) error {
+func (t *darwinTray) setIcon(png []byte) error {
 	if t.statusItem.IsNil() || t.btn.IsNil() {
 		return errors.New("darwin: tray not created")
 	}
@@ -403,7 +405,7 @@ func (t *darwinTray) SetIcon(png []byte) error {
 // SetTemplateIcon sets a macOS template image. Template images are monochrome
 // and the system automatically adjusts their appearance for the current menu
 // bar style (light/dark).
-func (t *darwinTray) SetTemplateIcon(png []byte) error {
+func (t *darwinTray) setTemplateIcon(png []byte) error {
 	if t.statusItem.IsNil() || t.btn.IsNil() {
 		return errors.New("darwin: tray not created")
 	}
@@ -455,7 +457,7 @@ func createNSImage(png []byte, template bool) darwin.ID {
 }
 
 // SetTooltip sets the hover tooltip text.
-func (t *darwinTray) SetTooltip(text string) error {
+func (t *darwinTray) setTooltip(text string) error {
 	if t.btn.IsNil() {
 		return errors.New("darwin: tray not created")
 	}
@@ -472,7 +474,7 @@ func (t *darwinTray) SetTooltip(text string) error {
 }
 
 // SetMenu builds an NSMenu from our Menu struct and attaches it to the status item.
-func (t *darwinTray) SetMenu(menu *Menu) error {
+func (t *darwinTray) setMenu(menu *Menu) error {
 	if t.statusItem.IsNil() {
 		return errors.New("darwin: tray not created")
 	}
@@ -651,11 +653,62 @@ func (t *darwinTray) updateItem(item menuItemSnapshot) error {
 	return nil
 }
 
+// onMain runs fn on the main thread and returns its error. AppKit requires
+// every status item mutation there; calling it from another goroutine
+// crashes ([NSStatusItem setMenu:] raises SIGTRAP). Before Create there is no
+// target to dispatch through, and nothing on screen, so fn runs directly.
+//
+// Called on the main thread, performSelectorOnMainThread with waitUntilDone
+// runs the drain immediately, so this does not deadlock.
+func (t *darwinTray) onMain(fn func() error) error {
+	if t.target.IsNil() {
+		return fn()
+	}
+	res := make(chan error, 1)
+	t.mainFuncs <- func() { res <- fn() }
+	drainSel := darwin.RegisterSelector("drainUpdates:")
+	darwin.MsgSend3Ptr(t.target, darwinSels.performSelectorOnMainThread,
+		uintptr(drainSel), 0, 1) // waitUntilDone:YES
+	return <-res
+}
+
+// SetIcon sets the tray icon from PNG bytes, on the main thread.
+func (t *darwinTray) SetIcon(png []byte) error {
+	return t.onMain(func() error { return t.setIcon(png) })
+}
+
+// SetTemplateIcon sets a macOS template image, on the main thread.
+func (t *darwinTray) SetTemplateIcon(png []byte) error {
+	return t.onMain(func() error { return t.setTemplateIcon(png) })
+}
+
+// SetTooltip sets the hover tooltip text, on the main thread.
+func (t *darwinTray) SetTooltip(text string) error {
+	return t.onMain(func() error { return t.setTooltip(text) })
+}
+
+// SetMenu attaches menu to the status item, on the main thread.
+func (t *darwinTray) SetMenu(menu *Menu) error {
+	return t.onMain(func() error { return t.setMenu(menu) })
+}
+
+// Show makes the status item visible, on the main thread.
+func (t *darwinTray) Show() error { return t.onMain(t.show) }
+
+// Hide removes the status item from the menu bar, on the main thread.
+func (t *darwinTray) Hide() error { return t.onMain(t.hide) }
+
 // applyPendingUpdates drains the pendingUpdates channel and applies AppKit
 // changes. MUST be called on the main thread (via drainUpdates: ObjC callback).
 // A snapshot with a zero ID signals Destroy.
 func (t *darwinTray) applyPendingUpdates() {
 	for {
+		select {
+		case fn := <-t.mainFuncs:
+			fn()
+			continue
+		default:
+		}
 		select {
 		case item := <-t.pendingUpdates:
 			if item.id == 0 {
@@ -742,7 +795,7 @@ func (t *darwinTray) ShowNotification(title, message string) error {
 
 // Show makes the tray icon visible. The status item is visible immediately
 // after Create(), so this is effectively a no-op unless Hide() was called.
-func (t *darwinTray) Show() error {
+func (t *darwinTray) show() error {
 	if !t.statusItem.IsNil() {
 		// Already visible.
 		return nil
@@ -762,7 +815,7 @@ func (t *darwinTray) Show() error {
 
 	// Restore icon if we had one.
 	if len(t.iconData) > 0 {
-		if err := t.SetIcon(t.iconData); err != nil {
+		if err := t.setIcon(t.iconData); err != nil {
 			slog.Warn("darwin: failed to restore icon after Show", "err", err)
 		}
 	}
@@ -784,7 +837,7 @@ func (t *darwinTray) Show() error {
 
 // Hide removes the status item from the menu bar without destroying the tray.
 // Call Show() to make it visible again.
-func (t *darwinTray) Hide() error {
+func (t *darwinTray) hide() error {
 	if t.statusBar.IsNil() || t.statusItem.IsNil() {
 		return nil
 	}
